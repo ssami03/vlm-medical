@@ -8,4 +8,5 @@ Pillow>=10.0
 tqdm>=4.65
 matplotlib>=3.7
 grad-cam>=1.5
+sacremoses>=0.1.1
 git+https://github.com/openai/CLIP.git
