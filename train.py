@@ -10,7 +10,7 @@ Phase 2: Train bridge + BioGPT decoder on real IU X-Ray reports
 Run from Colab:
     !python /content/vlm-medical/train.py
 """
-
+import clip
 import os
 import sys
 import json
@@ -27,6 +27,9 @@ from sklearn.metrics import roc_auc_score
 from config import (
     CKPT_DIR, RESULTS_DIR,
     CLASSIFIER_CKPT, DECODER_CKPT,
+    CLASSIFIER_STAGE1_CKPT, CLASSIFIER_STAGE2_CKPT,
+    CLASSIFIER_COMPARISON_JSON, CLIP_ZERO_SHOT_BASELINE_JSON,
+    CLIP_MODEL_NAME,
     CLASSIFIER_CFG, DECODER_CFG,
     DECODER_MODEL_NAME,
     PATHOLOGY_CLASSES, NUM_CLASSES,
@@ -45,136 +48,397 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+# ══════════════════════════════════════════════════════════════════
+# PHASE 1: CLASSIFICATION TRAINING — BASELINE + TWO-STAGE FINE-TUNING
+# ══════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════
-# PHASE 1: CLASSIFICATION TRAINING
-# ══════════════════════════════════════════════════════════════════
+def _make_classification_criterion(train_loader, device):
+    """BCE loss with class-wise positive weights for rare labels."""
+    train_labels_np = np.array(
+        [s['labels'] for s in train_loader.dataset.samples],
+        dtype=np.float32
+    )
+
+    pos_counts = train_labels_np.sum(axis=0)
+    neg_counts = len(train_labels_np) - pos_counts
+
+    pos_weight = torch.tensor(
+        np.clip(neg_counts / np.clip(pos_counts, 1.0, None), 1.0, 20.0),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+
+def _classification_pass(model, loader, device, criterion=None):
+    """Collect scores/targets and optionally average BCE loss."""
+    model.eval()
+    all_scores, all_targets = [], []
+    total_loss = 0.0
+
+    with torch.no_grad():
+        for images, labels, _ in loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                logits = model.classify(images)
+
+                if criterion is not None:
+                    loss = criterion(logits, labels)
+                    total_loss += loss.item()
+
+            all_scores.append(torch.sigmoid(logits).detach().cpu().numpy())
+            all_targets.append(labels.detach().cpu().numpy())
+
+    y_score = np.concatenate(all_scores)
+    y_true = np.concatenate(all_targets)
+    avg_loss = total_loss / len(loader) if criterion is not None else None
+
+    return y_score, y_true, avg_loss
+
+
+def _mean_auc_from_scores(y_true, y_score):
+    """Compute per-class AUROC and mean AUROC."""
+    aucs = {}
+
+    for i, cls in enumerate(PATHOLOGY_CLASSES):
+        true_col = y_true[:, i]
+        score_col = y_score[:, i]
+        n_pos = true_col.sum()
+
+        if n_pos >= 2:
+            try:
+                aucs[cls] = roc_auc_score(true_col, score_col)
+            except Exception:
+                aucs[cls] = float('nan')
+        else:
+            aucs[cls] = float('nan')
+
+    valid_aucs = [v for v in aucs.values() if not np.isnan(v)]
+    mean_auc = float(np.mean(valid_aucs)) if valid_aucs else 0.0
+
+    return mean_auc, aucs
+
+
+def evaluate_zero_shot_clip_baseline(test_loader, device):
+    """
+    Stage 0 baseline:
+    off-the-shelf OpenAI CLIP zero-shot prompting.
+    This gives the supervisor-requested before-adaptation comparison.
+    """
+    print(f"\n{'='*60}")
+    print("  STAGE 0: Frozen CLIP Zero-Shot Baseline")
+    print("  No supervised training; image-text prompt comparison only")
+    print(f"{'='*60}")
+
+    clip_model, _ = clip.load(CLIP_MODEL_NAME, device=device)
+    clip_model.eval()
+
+    prompt_pairs = []
+
+    for cls in PATHOLOGY_CLASSES:
+        disease = cls.lower()
+        prompt_pairs.extend([
+            f"a chest x-ray showing {disease}",
+            f"a chest x-ray with no evidence of {disease}",
+        ])
+
+    with torch.no_grad():
+        text_tokens = clip.tokenize(prompt_pairs).to(device)
+        text_features = clip_model.encode_text(text_tokens).float()
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features = text_features.view(len(PATHOLOGY_CLASSES), 2, -1)
+
+    all_scores, all_targets = [], []
+
+    with torch.no_grad():
+        for images, labels, _ in tqdm(test_loader, desc="Zero-shot CLIP"):
+            images = images.to(device)
+
+            image_features = clip_model.encode_image(images).float()
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+            logits = torch.einsum('bd,cpd->bcp', image_features, text_features)
+
+            # Index 0 = positive prompt, index 1 = negative prompt
+            probs = logits.softmax(dim=-1)[:, :, 0]
+
+            all_scores.append(probs.cpu().numpy())
+            all_targets.append(labels.numpy())
+
+    y_score = np.concatenate(all_scores)
+    y_true = np.concatenate(all_targets)
+
+    mean_auc, aucs = _mean_auc_from_scores(y_true, y_score)
+
+    baseline_results = {
+        'model': 'Frozen CLIP zero-shot baseline',
+        'mean_auc': mean_auc,
+        'per_class_auc': aucs,
+        'prompt_pairs': prompt_pairs,
+    }
+
+    with open(CLIP_ZERO_SHOT_BASELINE_JSON, 'w') as f:
+        json.dump(baseline_results, f, indent=2, default=str)
+
+    print(f"[Baseline] Mean test AUROC: {mean_auc:.4f}")
+
+    return baseline_results
+
+
+def _train_classifier_stage(
+    model,
+    device,
+    train_loader,
+    val_loader,
+    criterion,
+    stage_name,
+    epochs,
+    optimizer,
+    ckpt_path,
+):
+    """Train one classification stage and save best checkpoint by validation AUROC."""
+    cfg = CLASSIFIER_CFG
+    eps = cfg['label_smoothing']
+
+    total_steps = len(train_loader) * epochs
+    warmup_steps = len(train_loader) * cfg['warmup_epochs']
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
+
+    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
+
+    best_val_auc = -1.0
+    stage_log = []
+
+    print(f"\n{'─'*60}")
+    print(f"  {stage_name}")
+    print(f"  Epochs: {epochs}")
+    print(f"{'─'*60}")
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+
+        for images, labels, _ in tqdm(train_loader, desc=f"{stage_name} {epoch}/{epochs}"):
+            images = images.to(device)
+            labels = labels.to(device)
+
+            smooth_labels = labels * (1 - eps) + (1 - labels) * eps
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                logits = model.classify(images)
+                loss = criterion(logits, smooth_labels)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                max_norm=1.0,
+            )
+
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+            total_loss += loss.item()
+
+        avg_train_loss = total_loss / len(train_loader)
+
+        val_scores, val_targets, avg_val_loss = _classification_pass(
+            model,
+            val_loader,
+            device,
+            criterion,
+        )
+
+        mean_auc, aucs = _mean_auc_from_scores(val_targets, val_scores)
+
+        print(
+            f"\n{stage_name} Epoch {epoch}: "
+            f"train_loss={avg_train_loss:.4f} | "
+            f"val_loss={avg_val_loss:.4f} | "
+            f"val_AUROC={mean_auc:.4f}"
+        )
+
+        if mean_auc > best_val_auc:
+            best_val_auc = mean_auc
+
+            torch.save({
+                'stage': stage_name,
+                'epoch': epoch,
+                'model_state': model.state_dict(),
+                'val_mean_auc': mean_auc,
+                'per_class_auc': aucs,
+            }, ckpt_path)
+
+            print(f"  ★ New best {stage_name} AUROC={mean_auc:.4f} — saved to {ckpt_path}")
+
+        stage_log.append({
+            'stage': stage_name,
+            'epoch': epoch,
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'mean_auc': mean_auc,
+        })
+
+    return best_val_auc, stage_log
+
 
 def train_classifier(model: MedicalVLM, device: torch.device):
     """
-    Fine-tune CLIP visual encoder + classification head.
-    Differential LRs: 1e-6 backbone, 1e-4 head.
+    Supervisor-updated classification training:
+      Stage 0: frozen CLIP zero-shot baseline
+      Stage 1: freeze CLIP, train only classifier head
+      Stage 2: unfreeze full CLIP visual encoder and fine-tune gently
     """
     print(f"\n{'='*60}")
-    print(f"  PHASE 1: Classification Training")
-    print(f"  Dataset: IU X-Ray | Metric: AUROC")
+    print("  PHASE 1: Classification Training — Baseline + Two-Stage Fine-Tuning")
+    print("  Dataset: IU X-Ray | Metric: AUROC")
     print(f"{'='*60}")
 
     cfg = CLASSIFIER_CFG
     set_seed(cfg['seed'])
 
-    train_loader, val_loader, _ = build_dataloaders(
-        batch_size=cfg['batch_size'], num_workers=cfg['num_workers'],
+    train_loader, val_loader, test_loader = build_dataloaders(
+        batch_size=cfg['batch_size'],
+        num_workers=cfg['num_workers'],
         balance_train=True,
     )
 
-    model.freeze_for_classification()
-    param_groups = model.get_classifier_param_groups()
-    optimiser = torch.optim.AdamW(param_groups, weight_decay=cfg['weight_decay'])
+    criterion = _make_classification_criterion(train_loader, device)
 
-    # Class-wise positive weighting to help rare labels
-    train_labels_np = np.array([s['labels'] for s in train_loader.dataset.samples], dtype=np.float32)
-    pos_counts = train_labels_np.sum(axis=0)
-    neg_counts = len(train_labels_np) - pos_counts
-    pos_weight = torch.tensor(np.clip(neg_counts / np.clip(pos_counts, 1.0, None), 1.0, 20.0),
-                              dtype=torch.float32, device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # Stage 0: baseline before supervised medical adaptation
+    baseline_results = evaluate_zero_shot_clip_baseline(test_loader, device)
 
-    total_steps  = len(train_loader) * cfg['epochs']
-    warmup_steps = len(train_loader) * cfg['warmup_epochs']
-    scheduler = get_cosine_schedule_with_warmup(
-        optimiser, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    # Stage 1: freeze CLIP, train only classifier head
+    model.freeze_for_classification_head_only()
+
+    stage1_optimizer = torch.optim.AdamW(
+        model.get_classifier_head_params(),
+        weight_decay=cfg['weight_decay'],
     )
-    scaler = torch.amp.GradScaler('cuda')
-    eps = cfg['label_smoothing']
 
-    best_val_auc = 0.0
-    log = []
+    stage1_auc, stage1_log = _train_classifier_stage(
+        model=model,
+        device=device,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        stage_name='Stage 1: Frozen CLIP + trained classifier head',
+        epochs=cfg['stage1_epochs'],
+        optimizer=stage1_optimizer,
+        ckpt_path=CLASSIFIER_STAGE1_CKPT,
+    )
 
-    for epoch in range(1, cfg['epochs'] + 1):
-        model.train()
-        total_loss = 0.0
+    # Stage 2 starts from the best Stage 1 checkpoint
+    stage1_ckpt = torch.load(
+        CLASSIFIER_STAGE1_CKPT,
+        map_location=device,
+        weights_only=False,
+    )
+    model.load_state_dict(stage1_ckpt['model_state'])
 
-        for images, labels, _ in tqdm(train_loader, desc=f"Cls {epoch}/{cfg['epochs']}"):
-            images = images.to(device)
-            labels = labels.to(device)
-            smooth_labels = labels * (1 - eps) + (1 - labels) * eps
+    # Stage 2: unfreeze full CLIP visual encoder + classifier, fine-tune gently
+    model.freeze_for_classification_full()
 
-            optimiser.zero_grad()
-            with torch.amp.autocast('cuda'):
-                logits = model.classify(images)
-                loss = criterion(logits, smooth_labels)
+    stage2_optimizer = torch.optim.AdamW(
+        model.get_classifier_full_param_groups(),
+        weight_decay=cfg['weight_decay'],
+    )
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimiser)
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], max_norm=1.0
-            )
-            scaler.step(optimiser)
-            scaler.update()
-            scheduler.step()
-            total_loss += loss.item()
+    stage2_auc, stage2_log = _train_classifier_stage(
+        model=model,
+        device=device,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        stage_name='Stage 2: Full CLIP fine-tuning',
+        epochs=cfg['stage2_epochs'],
+        optimizer=stage2_optimizer,
+        ckpt_path=CLASSIFIER_STAGE2_CKPT,
+    )
 
-        avg_train_loss = total_loss / len(train_loader)
+    # Use Stage 2 as final classifier checkpoint for decoder training/evaluation
+    final_ckpt = torch.load(
+        CLASSIFIER_STAGE2_CKPT,
+        map_location=device,
+        weights_only=False,
+    )
+    torch.save(final_ckpt, CLASSIFIER_CKPT)
+    model.load_state_dict(final_ckpt['model_state'])
 
-        # Validate
-        model.eval()
-        all_scores, all_targets = [], []
-        val_loss = 0.0
+    # Test-set comparison table: baseline vs Stage 1 vs Stage 2
+    comparison = []
 
-        with torch.no_grad():
-            for images, labels, _ in val_loader:
-                images = images.to(device)
-                labels = labels.to(device)
-                with torch.amp.autocast('cuda'):
-                    logits = model.classify(images)
-                    loss = criterion(logits, labels)
-                val_loss += loss.item()
-                all_scores.append(torch.sigmoid(logits).cpu().numpy())
-                all_targets.append(labels.cpu().numpy())
+    comparison.append({
+        'model': 'Frozen CLIP zero-shot baseline',
+        'purpose': 'No supervised medical adaptation',
+        'test_mean_auc': baseline_results['mean_auc'],
+    })
 
-        avg_val_loss = val_loss / len(val_loader)
-        y_score = np.concatenate(all_scores)
-        y_true = np.concatenate(all_targets)
+    for label, path, purpose in [
+        (
+            'Stage 1: Frozen CLIP + trained classifier head',
+            CLASSIFIER_STAGE1_CKPT,
+            'Task-specific head adaptation only',
+        ),
+        (
+            'Stage 2: Full CLIP fine-tuning',
+            CLASSIFIER_STAGE2_CKPT,
+            'Full visual-domain adaptation',
+        ),
+    ]:
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state'])
 
-        aucs = {}
-        for i, cls in enumerate(PATHOLOGY_CLASSES):
-            n_pos = y_true[:, i].sum()
-            if n_pos >= 2:
-                try:
-                    aucs[cls] = roc_auc_score(y_true[:, i], y_score[:, i])
-                except:
-                    aucs[cls] = float('nan')
-            else:
-                aucs[cls] = float('nan')
+        scores, targets, test_loss = _classification_pass(
+            model,
+            test_loader,
+            device,
+            criterion,
+        )
 
-        valid_aucs = [v for v in aucs.values() if not np.isnan(v)]
-        mean_auc = np.mean(valid_aucs) if valid_aucs else 0.0
+        test_auc, test_aucs = _mean_auc_from_scores(targets, scores)
 
-        print(f"\nEpoch {epoch}: loss={avg_train_loss:.4f} | val_loss={avg_val_loss:.4f} | AUC={mean_auc:.4f}")
-        for cls, auc in aucs.items():
-            if not np.isnan(auc):
-                print(f"  {cls:<20s}: {auc:.4f}")
+        comparison.append({
+            'model': label,
+            'purpose': purpose,
+            'best_val_auc': ckpt.get('val_mean_auc'),
+            'test_mean_auc': test_auc,
+            'test_loss': test_loss,
+            'per_class_test_auc': test_aucs,
+        })
 
-        if mean_auc > best_val_auc:
-            best_val_auc = mean_auc
-            torch.save({
-                'epoch': epoch,
-                'model_state': model.state_dict(),
-                'val_mean_auc': mean_auc,
-                'per_class_auc': aucs,
-            }, CLASSIFIER_CKPT)
-            print(f"  ★ New best AUC={mean_auc:.4f} — saved")
+        print(f"[Comparison] {label}: test AUROC={test_auc:.4f}")
 
-        log.append({'epoch': epoch, 'train_loss': avg_train_loss,
-                    'val_loss': avg_val_loss, 'mean_auc': mean_auc})
+    with open(CLASSIFIER_COMPARISON_JSON, 'w') as f:
+        json.dump(comparison, f, indent=2, default=str)
+
+    combined_log = stage1_log + stage2_log
 
     with open(f'{RESULTS_DIR}/classifier_log.json', 'w') as f:
-        json.dump(log, f, indent=2)
+        json.dump(combined_log, f, indent=2)
 
-    print(f"\n  Phase 1 Complete! Best AUC: {best_val_auc:.4f}")
-    return best_val_auc
+    print(f"\n  Classification complete")
+    print(f"  Stage 1 best validation AUROC: {stage1_auc:.4f}")
+    print(f"  Stage 2 best validation AUROC: {stage2_auc:.4f}")
+    print(f"  Final classifier checkpoint: {CLASSIFIER_CKPT}")
+    print(f"  Comparison results: {CLASSIFIER_COMPARISON_JSON}")
 
+    # Reload final Stage 2 checkpoint before returning, so decoder training uses it
+    model.load_state_dict(final_ckpt['model_state'])
+
+    return stage2_auc
 
 # ══════════════════════════════════════════════════════════════════
 # PHASE 2: DECODER TRAINING (BioGPT)

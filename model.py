@@ -3,7 +3,7 @@ model.py — Vision-Language Model with BioGPT Decoder
 EEE3094 Dissertation — Sami Zarroug (220672267)
 
 Architecture:
-    CLIP ViT-B/32 (pre-trained, top CLIP blocks partially unfrozen)
+    CLIP ViT-B/32 (pre-trained, adapted using two-stage fine-tuning)
         → CLS token (512-dim) → MLP classifier (13 classes)
         → 49 patch tokens (768-dim) → Bridge MLP (768→1024)
             → Prepended as visual prefix to BioGPT input
@@ -57,10 +57,17 @@ class MedicalVLM(nn.Module):
             param.requires_grad_(False)
 
         if not freeze_encoder:
-            n_blocks = CLASSIFIER_CFG.get("unfreeze_blocks", 2)
-            for block in self.visual.transformer.resblocks[-n_blocks:]:
-                for param in block.parameters():
-                    param.requires_grad_(True)
+            n_blocks = CLASSIFIER_CFG.get("unfreeze_blocks", 0)
+
+            if n_blocks > 0:
+                for block in self.visual.transformer.resblocks[-n_blocks:]:
+                    for param in block.parameters():
+                        param.requires_grad_(True)
+            else:
+                print(
+                    "[VLM] freeze_encoder=False requested, but unfreeze_blocks=0; "
+                    "encoder remains frozen until explicit Stage 2 unfreezing."
+                )
 
         # Hook for patch tokens from last transformer block
         self._hook = self.visual.transformer.resblocks[-1].register_forward_hook(
@@ -336,28 +343,73 @@ class MedicalVLM(nn.Module):
         )
         return tokenizer.decode(output[0], skip_special_tokens=True)
 
-    # ──────────────────────────────────────────────────────────────
+      # ──────────────────────────────────────────────────────────────
     # Phase control methods
     # ──────────────────────────────────────────────────────────────
 
-    def freeze_for_classification(self):
-        """Phase 1: classifier head + top N visual blocks trainable."""
+    def freeze_for_classification_head_only(self):
+        """
+        Classification Stage 1:
+        Freeze the entire CLIP visual encoder and train only the new classifier head.
+
+        This follows the supervisor-recommended transfer-learning strategy:
+        first allow the newly added task-specific layers to adapt to the
+        IU X-Ray labels without changing the pretrained CLIP backbone.
+        """
         for p in self.parameters():
             p.requires_grad_(False)
 
         for p in self.classifier.parameters():
             p.requires_grad_(True)
 
-        n_blocks = CLASSIFIER_CFG.get("unfreeze_blocks", 2)
-        for block in self.visual.transformer.resblocks[-n_blocks:]:
-            for p in block.parameters():
-                p.requires_grad_(True)
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(
+            f"[VLM] Classification Stage 1: {trainable:,} trainable params "
+            f"(classifier head only)"
+        )
+
+    def freeze_for_classification_full(self):
+        """
+        Classification Stage 2:
+        Unfreeze the full CLIP visual encoder and classifier head.
+
+        This allows the pretrained visual encoder to adapt gently to the
+        chest X-ray domain using a very small backbone learning rate.
+        BioGPT and the bridge remain frozen during classification training.
+        """
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+        for p in self.visual.parameters():
+            p.requires_grad_(True)
+
+        for p in self.classifier.parameters():
+            p.requires_grad_(True)
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"[VLM] Classification mode: {trainable:,} trainable params")
+        print(
+            f"[VLM] Classification Stage 2: {trainable:,} trainable params "
+            f"(full CLIP visual encoder + classifier)"
+        )
+
+    def freeze_for_classification(self):
+        """
+        Backwards-compatible alias used by older smoke-test code.
+
+        New training uses:
+            - freeze_for_classification_head_only() for Stage 1
+            - freeze_for_classification_full() for Stage 2
+        """
+        self.freeze_for_classification_head_only()
 
     def freeze_for_decoder_prewarm(self):
-        """Phase 2a: only bridge MLP trainable."""
+        """
+        Decoder Phase 2a:
+        Freeze CLIP and BioGPT, train only the bridge MLP.
+
+        This forces the bridge to learn the visual-to-language projection
+        before the decoder begins adapting.
+        """
         for p in self.parameters():
             p.requires_grad_(False)
 
@@ -369,7 +421,12 @@ class MedicalVLM(nn.Module):
 
     def freeze_for_decoder_full(self):
         """
-        Phase 2b: bridge + top 2 visual blocks + BioGPT decoder trainable.
+        Decoder Phase 2b:
+        Train the bridge and BioGPT decoder while keeping CLIP frozen.
+
+        The CLIP visual encoder has already been adapted during classification
+        Stage 2, so it is frozen here to avoid undoing the supervised visual
+        domain adaptation during report-generation training.
         """
         for p in self.parameters():
             p.requires_grad_(False)
@@ -377,27 +434,51 @@ class MedicalVLM(nn.Module):
         for p in self.bridge.parameters():
             p.requires_grad_(True)
 
-        for block in self.visual.transformer.resblocks[-2:]:
-            for p in block.parameters():
-                p.requires_grad_(True)
-
         for p in self.decoder.parameters():
             p.requires_grad_(True)
 
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"[VLM] Full decoder mode: {trainable:,} trainable params")
+        print(
+            f"[VLM] Full decoder mode: {trainable:,} trainable params "
+            f"(bridge + BioGPT; CLIP frozen)"
+        )
+
+    def get_classifier_head_params(self):
+        """
+        Stage 1 optimiser parameters:
+        classifier head only.
+        """
+        return [
+            {
+                "params": list(self.classifier.parameters()),
+                "lr": CLASSIFIER_CFG["stage1_lr_head"],
+            }
+        ]
+
+    def get_classifier_full_param_groups(self):
+        """
+        Stage 2 optimiser parameter groups:
+        full CLIP visual encoder with a very small LR, classifier head with a larger LR.
+        """
+        return [
+            {
+                "params": list(self.visual.parameters()),
+                "lr": CLASSIFIER_CFG["stage2_lr_backbone"],
+            },
+            {
+                "params": list(self.classifier.parameters()),
+                "lr": CLASSIFIER_CFG["stage2_lr_head"],
+            },
+        ]
 
     def get_classifier_param_groups(self):
-        """Differential learning rates: slow backbone, faster head."""
-        n_blocks = CLASSIFIER_CFG.get("unfreeze_blocks", 2)
-        backbone_params = []
-        for block in self.visual.transformer.resblocks[-n_blocks:]:
-            backbone_params.extend(list(block.parameters()))
+        """
+        Backwards-compatible alias for older code.
 
-        return [
-            {"params": backbone_params, "lr": CLASSIFIER_CFG["lr_backbone"]},
-            {"params": list(self.classifier.parameters()), "lr": CLASSIFIER_CFG["lr_head"]},
-        ]
+        The new Stage 2 strategy fine-tunes the full visual encoder rather than
+        randomly selecting the top N transformer blocks.
+        """
+        return self.get_classifier_full_param_groups()
 
 
 class CLIPClassifierForGradCAM(nn.Module):

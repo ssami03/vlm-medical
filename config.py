@@ -18,12 +18,18 @@ REPORTS_CSV     = f'{DATA_DIR}/indiana_reports.csv'
 PROJECTIONS_CSV = f'{DATA_DIR}/indiana_projections.csv'
 IMAGES_DIR      = f'{DATA_DIR}/images/images_normalized'
 
-# Processed dataa
+# Processed data
 PROCESSED_JSON = f'{DATA_DIR}/processed_dataset.json'
 
-# Checkpoints
+# Final classifier checkpoint used by decoder training/evaluation
 CLASSIFIER_CKPT = f'{CKPT_DIR}/classifier_best.pt'
 DECODER_CKPT    = f'{CKPT_DIR}/decoder_best.pt'
+
+# Extra checkpoints/results for supervisor-requested baseline + two-stage fine-tuning
+CLASSIFIER_STAGE1_CKPT = f'{CKPT_DIR}/classifier_stage1_head_only.pt'
+CLASSIFIER_STAGE2_CKPT = f'{CKPT_DIR}/classifier_stage2_full_finetune.pt'
+CLASSIFIER_COMPARISON_JSON = f'{RESULTS_DIR}/classification_stage_comparison.json'
+CLIP_ZERO_SHOT_BASELINE_JSON = f'{RESULTS_DIR}/clip_zero_shot_baseline.json'
 
 # ── Pathology Classes ─────────────────────────────────────────────
 # 13 common chest X-ray pathologies extractable from IU X-Ray reports
@@ -90,18 +96,28 @@ DECODER_HIDDEN_DIM = 1024    # BioGPT hidden size (vs 768 for distilgpt2)
 
 # ── Classifier Hyperparameters ────────────────────────────────────
 CLASSIFIER_CFG = {
-    'epochs':          12,
-    'batch_size':      32,
-    'lr_head':         5e-5,
-    'lr_backbone':     1e-6,
-    'weight_decay':    1e-4,
-    'warmup_epochs':   1,
-    'label_smoothing': 0.05,
-    'dropout':         0.1,
-    'seed':            42,
-    'num_workers':     2,
-    'image_size':      224,
-    'unfreeze_blocks': 4,
+    # Supervisor-updated two-stage transfer-learning schedule
+    'stage1_epochs':        15,
+    'stage2_epochs':        15,
+    'batch_size':           32,
+
+    # AdamW-safe learning rates
+    # Your supervisor mentioned 0.1/0.01, but those are usually too high for AdamW.
+    'stage1_lr_head':       1e-3,
+    'stage2_lr_backbone':   1e-6,
+    'stage2_lr_head':       1e-4,
+
+    'weight_decay':         1e-4,
+    'warmup_epochs':        1,
+    'label_smoothing':      0.05,
+    'dropout':              0.1,
+    'seed':                 42,
+    'num_workers':          2,
+    'image_size':           224,
+
+    # Kept for backwards compatibility only.
+    # The new training strategy does NOT use top-N unfreezing.
+    'unfreeze_blocks':      0,
 }
 
 # ── Decoder Hyperparameters ───────────────────────────────────────
